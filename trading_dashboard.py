@@ -31,12 +31,14 @@ def init_exchange():
 binance = init_exchange()
 
 # ---------------------------------------------------------
-# 2. 지표 계산 및 신호 감지
+# 2. 지표 계산 (RSI, CCI 추가)
 # ---------------------------------------------------------
 def calculate_indicators(df):
+    # 1. EMA
     for period in [20, 60, 120, 200]:
         df[f'EMA_{period}'] = df['close'].ewm(span=period, adjust=False).mean()
 
+    # 2. 일목균형표
     high_9 = df['high'].rolling(window=9).max()
     low_9 = df['low'].rolling(window=9).min()
     df['tenkan_sen'] = (high_9 + low_9) / 2
@@ -50,49 +52,103 @@ def calculate_indicators(df):
     high_52 = df['high'].rolling(window=52).max()
     low_52 = df['low'].rolling(window=52).min()
     df['span_b'] = ((high_52 + low_52) / 2).shift(26)
+
+    # 3. RSI (Relative Strength Index, 14)
+    delta = df['close'].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+    rs = gain / loss
+    df['RSI'] = 100 - (100 / (1 + rs))
+
+    # 4. CCI (Commodity Channel Index, 20)
+    tp = (df['high'] + df['low'] + df['close']) / 3
+    sma_tp = tp.rolling(window=20).mean()
+    mean_dev = (tp - sma_tp).abs().rolling(window=20).mean()
+    df['CCI'] = (tp - sma_tp) / (0.015 * mean_dev)
     
     return df
 
-def check_signal(df, strict_mode=False):
+def check_multistrategy_signal(df, strategies):
     if len(df) < 52: return None
     
-    curr = df.iloc[-2] 
+    curr = df.iloc[-2]
     prev = df.iloc[-3]
-
-    cloud_top = max(curr['span_a'], curr['span_b'])
-    cloud_bottom = min(curr['span_a'], curr['span_b'])
     
-    signal = None
+    signals = [] 
 
-    if strict_mode:
-        # [엄격 모드]
-        volume_surge = curr['volume'] > prev['volume'] * 2.0
-        
-        is_bearish_cloud = curr['span_a'] < curr['span_b']
-        breakout_up = prev['close'] <= cloud_top and curr['close'] > cloud_top
-        
-        if is_bearish_cloud and breakout_up and volume_surge:
-            signal = "🔥 STRONG BUY (Breakout)"
+    # 공통: 거래량 급증
+    volume_surge = curr['volume'] > prev['volume'] * 2.0
+    
+    # -----------------------------------------------------
+    # 1. 급등/급락 감지 (10% 이상)
+    # -----------------------------------------------------
+    if strategies.get('surge'):
+        change_pct = (curr['close'] - prev['close']) / prev['close'] * 100
+        if change_pct >= 10.0:
+            signals.append(f"🚀 급등 (+{change_pct:.1f}%)")
+        elif change_pct <= -10.0:
+            signals.append(f"😱 급락 ({change_pct:.1f}%)")
 
-        is_bullish_cloud = curr['span_a'] > curr['span_b']
-        breakdown_down = prev['close'] >= cloud_bottom and curr['close'] < cloud_bottom
-        
-        if is_bullish_cloud and breakdown_down and volume_surge:
-            signal = "💧 STRONG SELL (Breakdown)"
+    # -----------------------------------------------------
+    # 2. 이평선 크로스
+    # -----------------------------------------------------
+    if strategies.get('cross'):
+        if prev['EMA_20'] < prev['EMA_60'] and curr['EMA_20'] > curr['EMA_60']:
+            signals.append("❌ 골든 크로스 (20/60)")
+        if prev['EMA_20'] > prev['EMA_60'] and curr['EMA_20'] < curr['EMA_60']:
+            signals.append("☠️ 데드 크로스 (20/60)")
 
-    else:
-        # [일반 모드]
-        if curr['close'] > cloud_top:
-            signal = "📈 BUY Trend"
-        elif curr['close'] < cloud_bottom:
-            signal = "📉 SELL Trend"
+    # -----------------------------------------------------
+    # 3. 200EMA 돌파
+    # -----------------------------------------------------
+    if strategies.get('ma200'):
+        if prev['close'] < prev['EMA_200'] and curr['close'] > curr['EMA_200'] and volume_surge:
+            signals.append("💥 200EMA 상향 돌파")
+        if prev['close'] > prev['EMA_200'] and curr['close'] < curr['EMA_200'] and volume_surge:
+            signals.append("📉 200EMA 하향 이탈")
+
+    # -----------------------------------------------------
+    # 4. 구름대 돌파
+    # -----------------------------------------------------
+    if strategies.get('cloud'):
+        cloud_top = max(curr['span_a'], curr['span_b'])
+        cloud_bottom = min(curr['span_a'], curr['span_b'])
+        
+        if curr['span_a'] < curr['span_b'] and volume_surge:
+            if prev['close'] <= cloud_top and curr['close'] > cloud_top:
+                signals.append("☁️ 구름대 상향 돌파")
+        if curr['span_a'] > curr['span_b'] and volume_surge:
+            if prev['close'] >= cloud_bottom and curr['close'] < cloud_bottom:
+                signals.append("🌧 구름대 하향 이탈")
+
+    # -----------------------------------------------------
+    # 5. [NEW] 과매수 / 과매도 (RSI & CCI)
+    # -----------------------------------------------------
+    if strategies.get('oscillators'):
+        rsi = curr['RSI']
+        cci = curr['CCI']
+
+        # 과매수 (Overbought) -> 매도 관점
+        if rsi > 70:
+            signals.append(f"🔴 RSI 과매수 ({rsi:.0f})")
+        if cci > 100:
+            signals.append(f"🔴 CCI 과매수 ({cci:.0f})")
             
-    return signal
+        # 과매도 (Oversold) -> 매수 관점
+        if rsi < 30:
+            signals.append(f"🔵 RSI 과매도 ({rsi:.0f})")
+        if cci < -100:
+            signals.append(f"🔵 CCI 과매도 ({cci:.0f})")
+
+    if signals:
+        return ", ".join(signals)
+    else:
+        return None
 
 # ---------------------------------------------------------
 # 3. 데이터 스캔
 # ---------------------------------------------------------
-def scan_market(target_timeframes, start_rank, end_rank, strict_mode):
+def scan_market(target_timeframes, start_rank, end_rank, active_strategies):
     progress_bar = st.progress(0, text="시장 데이터를 불러오는 중...")
     
     try:
@@ -124,7 +180,7 @@ def scan_market(target_timeframes, start_rank, end_rank, strict_mode):
                 df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
                 
                 df = calculate_indicators(df)
-                signal = check_signal(df, strict_mode)
+                signal = check_multistrategy_signal(df, active_strategies)
                 
                 if signal:
                     results.append({
@@ -142,7 +198,7 @@ def scan_market(target_timeframes, start_rank, end_rank, strict_mode):
     return results
 
 # ---------------------------------------------------------
-# 4. 차트 그리기
+# 4. 차트 그리기 (RSI 추가)
 # ---------------------------------------------------------
 def plot_chart(item):
     df = item['data']
@@ -150,14 +206,19 @@ def plot_chart(item):
     tf = item['timeframe']
     signal_type = item['signal']
     
-    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, 
-                        vertical_spacing=0.03, row_heights=[0.7, 0.3])
+    # 3행 구조로 변경 (가격 / 거래량 / RSI)
+    fig = make_subplots(rows=3, cols=1, shared_xaxes=True, 
+                        vertical_spacing=0.03, 
+                        row_heights=[0.6, 0.2, 0.2])
 
+    # 1. Price Chart
     fig.add_trace(go.Candlestick(x=df['timestamp'],
                 open=df['open'], high=df['high'],
                 low=df['low'], close=df['close'], name='Price'), row=1, col=1)
 
-    fill_color = 'rgba(0, 255, 0, 0.1)' if 'BUY' in signal_type else 'rgba(255, 0, 0, 0.1)'
+    fill_color = 'rgba(0, 255, 0, 0.1)'
+    if '하락' in signal_type or '데드' in signal_type or '과매수' in signal_type:
+        fill_color = 'rgba(255, 0, 0, 0.1)'
     
     fig.add_trace(go.Scatter(x=df['timestamp'], y=df['span_a'], 
                              line=dict(color='rgba(0,0,0,0)'), showlegend=False), row=1, col=1)
@@ -165,17 +226,26 @@ def plot_chart(item):
                              fill='tonexty', fillcolor=fill_color,
                              line=dict(color='rgba(0,0,0,0)'), name='Cloud'), row=1, col=1)
 
-    colors = {'EMA_20': 'yellow', 'EMA_60': 'orange', 'EMA_120': 'purple', 'EMA_200': 'blue'}
+    colors = {'EMA_20': 'yellow', 'EMA_60': 'orange', 'EMA_200': 'blue'}
     for name, color in colors.items():
         fig.add_trace(go.Scatter(x=df['timestamp'], y=df[name], 
                                  line=dict(color=color, width=1), name=name), row=1, col=1)
 
+    # 2. Volume Chart
     fig.add_trace(go.Bar(x=df['timestamp'], y=df['volume'], marker_color='gray', name='Volume'), row=2, col=1)
+
+    # 3. RSI Chart
+    fig.add_trace(go.Scatter(x=df['timestamp'], y=df['RSI'], 
+                             line=dict(color='purple', width=2), name='RSI'), row=3, col=1)
+    
+    # RSI 기준선 (30, 70)
+    fig.add_hline(y=70, line_dash="dash", line_color="red", row=3, col=1)
+    fig.add_hline(y=30, line_dash="dash", line_color="green", row=3, col=1)
 
     fig.update_layout(
         title=f"📊 {clean_symbol} [{tf}] - {signal_type}",
         xaxis_rangeslider_visible=False,
-        height=600,
+        height=800, # 차트 높이 증가
         template="plotly_dark",
         margin=dict(l=20, r=20, t=50, b=20)
     )
@@ -184,17 +254,27 @@ def plot_chart(item):
 # ---------------------------------------------------------
 # 5. UI 구성
 # ---------------------------------------------------------
-st.title("🚀 Binance Futures AI Scanner")
+st.title("🚀 Binance Futures AI Scanner (RSI/CCI Included)")
 
 with st.sidebar:
     st.header("⚙️ 스캔 설정")
     
-    strict_mode = st.toggle("🔒 엄격한 돌파 모드 (Strict Mode)", value=False)
-    
-    if strict_mode:
-        st.caption("✅ 조건: 거래량 2배 폭등 + 구름대 돌파 (신호가 적게 나옵니다)")
-    else:
-        st.caption("✅ 조건: 현재 가격이 구름대 위에 있으면 표시 (신호가 많이 나옵니다)")
+    st.subheader("📡 감시할 전략 선택")
+    use_cloud = st.toggle("☁️ 일목균형표 구름대 돌파", value=True)
+    use_surge = st.toggle("🚀 급등/급락 (10% 이상)", value=True)
+    use_cross = st.toggle("❌ EMA 골든/데드 크로스", value=False)
+    use_ma200 = st.toggle("💥 200EMA 돌파 (추세전환)", value=False)
+    use_osc = st.toggle("🌊 RSI/CCI 과매수·과매도", value=True)
+
+    active_strategies = {
+        'cloud': use_cloud,
+        'surge': use_surge,
+        'cross': use_cross,
+        'ma200': use_ma200,
+        'oscillators': use_osc
+    }
+
+    st.divider()
 
     selected_tfs = st.multiselect(
         "분석할 시간대",
@@ -210,16 +290,19 @@ with st.sidebar:
         step=1
     )
     start_rank, end_rank = rank_range
-    count = end_rank - start_rank + 1
     
     st.divider()
     
     if st.button("🚨 스캔 시작 (START)", type="primary"):
         if not selected_tfs:
             st.error("시간대를 선택해주세요.")
+        elif not any(active_strategies.values()):
+            st.error("최소 한 가지 이상의 전략을 선택해주세요.")
         else:
             st.session_state['scan_results'] = []
-            st.session_state['scan_results'] = scan_market(selected_tfs, start_rank, end_rank, strict_mode)
+            st.session_state['scan_results'] = scan_market(
+                selected_tfs, start_rank, end_rank, active_strategies
+            )
 
 # 결과 화면
 if 'scan_results' in st.session_state and st.session_state['scan_results']:
@@ -234,21 +317,25 @@ if 'scan_results' in st.session_state and st.session_state['scan_results']:
         for i, item in enumerate(results):
             clean_symbol = item['symbol'].split(':')[0]
             timeframe = item['timeframe']
-            is_buy = 'BUY' in item['signal']
-            emoji = "🔥" if "STRONG" in item['signal'] else ("📈" if is_buy else "📉")
+            signal_text = item['signal']
             
+            # 이모지 로직
+            emoji = "⚡️"
+            if "과매수" in signal_text or "급락" in signal_text or "하향" in signal_text:
+                emoji = "📉"
+            elif "과매도" in signal_text or "급등" in signal_text or "상향" in signal_text:
+                emoji = "📈"
+
             with st.container(border=True):
                 st.markdown(f"**{clean_symbol}** &nbsp; ` {timeframe} `")
-                st.caption(f"{emoji} {item['signal']}")
+                st.info(f"{emoji} {signal_text}")
                 
                 btn_col1, btn_col2 = st.columns(2)
                 
-                # 차트 버튼 (일반 버튼은 key 필요)
                 with btn_col1:
                     if st.button(f"차트 📊", key=f"btn_chart_{i}_{clean_symbol}_{timeframe}"):
                         st.session_state['selected_item'] = item
                 
-                # 거래소 링크 (key 인자 제거됨)
                 with btn_col2:
                     raw_symbol = clean_symbol.replace("/", "") 
                     url = f"https://www.binance.com/en/futures/{raw_symbol}"
