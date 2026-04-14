@@ -3,11 +3,9 @@ import pandas as pd
 import time
 import requests
 from datetime import datetime, timedelta, timezone
-import sys
 import os
 from dotenv import load_dotenv
 
-# .env 파일 로드
 load_dotenv()
 
 # ==========================================
@@ -19,14 +17,24 @@ BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
 BINANCE_SECRET = os.getenv("BINANCE_SECRET_KEY")
 
 # 감시할 시간대
-# TARGET_TIMEFRAMES = ['15m', '1h', '4h', '1d'] 
-TARGET_TIMEFRAMES = ['1h', '4h', '1d'] 
-COIN_LIMIT = 100       
+TARGET_TIMEFRAMES = ['15m', '1h', '4h', '1d']
 
-# 데이터 갱신 대기 시간 (초)
-WAIT_BUFFER_SECONDS = 15 
+# 거래대금 상위 코인 수
+COIN_LIMIT = 100
 
-# 한국 시간대 정의 (UTC+9)
+# 스캔 주기 (초) - 이 간격마다 현재 가격으로 지표 돌파 여부 확인
+SCAN_INTERVAL_SECONDS = 60
+
+# 쿨다운 설정 (같은 신호 재알림 방지, 시간프레임별 자동 조절)
+COOLDOWN_MAP = {
+    '5m':  300,      # 5분
+    '15m': 900,      # 15분
+    '1h':  3600,     # 1시간
+    '4h':  14400,    # 4시간
+    '1d':  86400,    # 1일
+}
+
+# 한국 시간대 (UTC+9)
 KST = timezone(timedelta(hours=9))
 
 # 바이낸스 객체
@@ -37,51 +45,45 @@ binance = ccxt.binance({
     'options': {'defaultType': 'future'}
 })
 
-alert_history = {}
+# 쿨다운 기록: { "BTC/USDT_1h_골든크로스": timestamp }
+alert_cooldown = {}
 
+
+# ==========================================
+# 텔레그램 전송
+# ==========================================
 def send_telegram_msg(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     data = {'chat_id': CHAT_ID, 'text': message, 'parse_mode': 'Markdown'}
     try:
-        requests.post(url, data=data, timeout=5)
+        requests.post(url, data=data, timeout=10)
     except Exception as e:
         print(f"❌ 텔레그램 전송 에러: {e}")
 
-def get_timeframes_to_check(current_utc):
-    to_check = []
-    minute = current_utc.minute
-    hour = current_utc.hour 
-    
-    # 5m은 제외하고 15m, 1h, 4h, 1d 위주로 다양한 전략 감시 추천
-    if '15m' in TARGET_TIMEFRAMES and minute % 15 == 0: to_check.append('15m')
-    if '1h' in TARGET_TIMEFRAMES and minute == 0: to_check.append('1h')
-    if '4h' in TARGET_TIMEFRAMES and minute == 0 and hour % 4 == 0: to_check.append('4h')
-    if '1d' in TARGET_TIMEFRAMES and minute == 0 and hour == 0: to_check.append('1d')
-        
-    return to_check
 
-def wait_for_next_slot():
-    now_utc = datetime.now(timezone.utc)
-    next_minute = (now_utc.minute // 5 + 1) * 5
-    next_time_utc = now_utc.replace(minute=0, second=0, microsecond=0) + timedelta(minutes=next_minute)
-    target_time_utc = next_time_utc + timedelta(seconds=WAIT_BUFFER_SECONDS)
-    
-    sleep_seconds = (target_time_utc - now_utc).total_seconds()
-    if sleep_seconds < 0:
-        sleep_seconds += 300
-        target_time_utc += timedelta(minutes=5)
+def is_cooled_down(symbol, tf, signal_name):
+    """쿨다운 확인: 같은 (심볼, 시간프레임, 신호타입)에 대해 재알림 방지"""
+    key = f"{symbol}_{tf}_{signal_name}"
+    now = time.time()
+    cooldown_sec = COOLDOWN_MAP.get(tf, 3600)
 
-    target_kst = target_time_utc.astimezone(KST)
-    print(f"\n💤 대기 중... 다음 실행: {target_kst.strftime('%H:%M:%S')} (KST)")
-    time.sleep(sleep_seconds)
-    return datetime.now(timezone.utc)
+    if key in alert_cooldown:
+        elapsed = now - alert_cooldown[key]
+        if elapsed < cooldown_sec:
+            return False  # 아직 쿨다운 중
+    alert_cooldown[key] = now
+    return True
 
+
+# ==========================================
+# 지표 계산
+# ==========================================
 def calculate_indicators(df):
-    # EMA 계산
+    # EMA
     for period in [20, 60, 120, 200]:
         df[f'EMA_{period}'] = df['close'].ewm(span=period, adjust=False).mean()
 
-    # 일목균형표 계산
+    # 일목균형표
     high_9 = df['high'].rolling(window=9).max()
     low_9 = df['low'].rolling(window=9).min()
     df['tenkan_sen'] = (high_9 + low_9) / 2
@@ -94,158 +96,214 @@ def calculate_indicators(df):
     high_52 = df['high'].rolling(window=52).max()
     low_52 = df['low'].rolling(window=52).min()
     df['span_b'] = ((high_52 + low_52) / 2).shift(26)
+
+    # RSI (14)
+    delta = df['close'].diff()
+    gain = delta.where(delta > 0, 0).rolling(window=14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+    rs = gain / loss
+    df['RSI'] = 100 - (100 / (1 + rs))
+
+    # MACD (12, 26, 9)
+    ema_12 = df['close'].ewm(span=12, adjust=False).mean()
+    ema_26 = df['close'].ewm(span=26, adjust=False).mean()
+    df['MACD'] = ema_12 - ema_26
+    df['MACD_signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
+    df['MACD_hist'] = df['MACD'] - df['MACD_signal']
+
+    # 볼린저 밴드 (20, 2σ)
+    df['BB_mid'] = df['close'].rolling(window=20).mean()
+    bb_std = df['close'].rolling(window=20).std()
+    df['BB_upper'] = df['BB_mid'] + 2 * bb_std
+    df['BB_lower'] = df['BB_mid'] - 2 * bb_std
+
     return df
 
-# =========================================================
-# 🔍 [핵심] 멀티 전략 신호 감지 함수
-# =========================================================
-def check_multistrategy_signal(df):
-    if len(df) < 52: return None
-    
-    # 현재 확정된 봉(Close된 봉) 기준
-    curr = df.iloc[-2]
-    prev = df.iloc[-3]
-    
-    signals = [] # 발생한 모든 신호를 담을 리스트
 
-    # 공통 조건: 거래량 급증 (평소의 2배 이상)
-    # 거래량이 너무 적은 봉의 신호는 속임수일 확률이 높음
+# =========================================================
+# 🔍 [핵심] 실시간 멀티 전략 신호 감지
+#    - prev: 직전 마감 봉 (df.iloc[-2])
+#    - curr: 현재 진행 중인 봉 (df.iloc[-1], 실시간 가격 반영)
+# =========================================================
+def check_realtime_signals(df):
+    if len(df) < 52:
+        return []
+
+    curr = df.iloc[-1]   # 현재 봉 (아직 마감되지 않은, 실시간 가격)
+    prev = df.iloc[-2]   # 직전 마감 봉
+
+    signals = []
+
+    # 공통: 거래량 급증 (현재 봉의 거래량이 이전 마감 봉 대비 2배)
     volume_surge = curr['volume'] > prev['volume'] * 2.0
-    
-    # -----------------------------------------------------
-    # 전략 1: 급등/급락 감지 (10% 이상 변동)
-    # -----------------------------------------------------
+
+    # -------------------------------------------------
+    # 1. 급등/급락 감지 (직전 마감가 대비 현재가)
+    # -------------------------------------------------
     change_pct = (curr['close'] - prev['close']) / prev['close'] * 100
     if change_pct >= 10.0:
-        signals.append(f"🚀 급등 발생 (+{change_pct:.1f}%)")
+        signals.append(("급등", f"🚀 급등 발생 (+{change_pct:.1f}%)"))
     elif change_pct <= -10.0:
-        signals.append(f"😱 급락 발생 ({change_pct:.1f}%)")
+        signals.append(("급락", f"😱 급락 발생 ({change_pct:.1f}%)"))
 
-    # -----------------------------------------------------
-    # 전략 2: 이평선 크로스 (EMA 20 vs EMA 60)
-    # -----------------------------------------------------
-    # 골든 크로스: 이전엔 20 < 60 이었는데, 지금은 20 > 60
+    # -------------------------------------------------
+    # 2. EMA 크로스 (20 vs 60)
+    #    직전 봉까지 20<60이었는데 현재가 기준 20>60이면 골든크로스
+    # -------------------------------------------------
     if prev['EMA_20'] < prev['EMA_60'] and curr['EMA_20'] > curr['EMA_60']:
-        signals.append("❌ 골든 크로스 (20 돌파 60)")
-    
-    # 데드 크로스
+        signals.append(("골든크로스", "✨ 골든 크로스 (EMA20 ↑ EMA60)"))
     if prev['EMA_20'] > prev['EMA_60'] and curr['EMA_20'] < curr['EMA_60']:
-        signals.append("☠️ 데드 크로스 (20 하향 60)")
+        signals.append(("데드크로스", "☠️ 데드 크로스 (EMA20 ↓ EMA60)"))
 
-    # -----------------------------------------------------
-    # 전략 3: 장기 이평선(200EMA) 강력 돌파
-    # -----------------------------------------------------
-    # 상향 돌파 (거래량 동반 필수)
+    # -------------------------------------------------
+    # 3. 200EMA 돌파 (거래량 동반)
+    # -------------------------------------------------
     if prev['close'] < prev['EMA_200'] and curr['close'] > curr['EMA_200'] and volume_surge:
-        signals.append("💥 200EMA 상향 돌파 (강한 추세 전환)")
-    
-    # 하향 돌파
+        signals.append(("200EMA상향", "💥 200EMA 상향 돌파 (추세 전환)"))
     if prev['close'] > prev['EMA_200'] and curr['close'] < curr['EMA_200'] and volume_surge:
-        signals.append("📉 200EMA 하향 이탈 (추세 붕괴)")
+        signals.append(("200EMA하향", "📉 200EMA 하향 이탈 (추세 붕괴)"))
 
-    # -----------------------------------------------------
-    # 전략 4: 구름대 (일목균형표) 돌파 - 기존 전략
-    # -----------------------------------------------------
-    cloud_top = max(curr['span_a'], curr['span_b'])
-    cloud_bottom = min(curr['span_a'], curr['span_b'])
-    
-    # 구름대 상향 돌파 (저항 구름 뚫음)
-    if curr['span_a'] < curr['span_b'] and volume_surge: # 음운일 때
-        if prev['close'] <= cloud_top and curr['close'] > cloud_top:
-            signals.append("☁️ 구름대 상향 돌파 (매수 찬스)")
+    # -------------------------------------------------
+    # 4. 일목균형표 구름대 돌파 (거래량 동반)
+    # -------------------------------------------------
+    if pd.notna(curr['span_a']) and pd.notna(curr['span_b']):
+        cloud_top = max(curr['span_a'], curr['span_b'])
+        cloud_bottom = min(curr['span_a'], curr['span_b'])
 
-    # 구름대 하향 이탈 (지지 구름 뚫림)
-    if curr['span_a'] > curr['span_b'] and volume_surge: # 양운일 때
-        if prev['close'] >= cloud_bottom and curr['close'] < cloud_bottom:
-            signals.append("🌧 구름대 하향 이탈 (매도 주의)")
+        # 음운(저항) 상향 돌파
+        if curr['span_a'] < curr['span_b'] and volume_surge:
+            if prev['close'] <= cloud_top and curr['close'] > cloud_top:
+                signals.append(("구름상향", "☁️ 구름대 상향 돌파 (매수 찬스)"))
 
-    # 신호가 하나라도 있으면 합쳐서 리턴
-    if signals:
-        return "\n".join(signals)
-    else:
-        return None
+        # 양운(지지) 하향 이탈
+        if curr['span_a'] > curr['span_b'] and volume_surge:
+            if prev['close'] >= cloud_bottom and curr['close'] < cloud_bottom:
+                signals.append(("구름하향", "🌧 구름대 하향 이탈 (매도 주의)"))
 
+    # -------------------------------------------------
+    # 5. RSI 과매수/과매도
+    # -------------------------------------------------
+    if pd.notna(curr['RSI']):
+        if curr['RSI'] > 70:
+            signals.append(("RSI과매수", f"🔴 RSI 과매수 ({curr['RSI']:.0f})"))
+        elif curr['RSI'] < 30:
+            signals.append(("RSI과매도", f"🔵 RSI 과매도 ({curr['RSI']:.0f})"))
+
+    # -------------------------------------------------
+    # 6. MACD 크로스
+    # -------------------------------------------------
+    if pd.notna(prev['MACD']) and pd.notna(curr['MACD']):
+        if prev['MACD'] < prev['MACD_signal'] and curr['MACD'] > curr['MACD_signal']:
+            signals.append(("MACD골든", "📗 MACD 골든 크로스 (매수 신호)"))
+        if prev['MACD'] > prev['MACD_signal'] and curr['MACD'] < curr['MACD_signal']:
+            signals.append(("MACD데드", "📕 MACD 데드 크로스 (매도 신호)"))
+
+    # -------------------------------------------------
+    # 7. 볼린저 밴드 이탈
+    # -------------------------------------------------
+    if pd.notna(curr['BB_upper']) and pd.notna(curr['BB_lower']):
+        if prev['close'] <= prev['BB_upper'] and curr['close'] > curr['BB_upper']:
+            signals.append(("BB상단돌파", f"🔺 볼린저 상단 돌파 (과열 주의)"))
+        if prev['close'] >= prev['BB_lower'] and curr['close'] < curr['BB_lower']:
+            signals.append(("BB하단이탈", f"🔻 볼린저 하단 이탈 (반등 기대)"))
+
+    return signals
+
+
+# ==========================================
+# 메인 봇 루프
+# ==========================================
 def run_bot():
     if not BINANCE_API_KEY or not TELEGRAM_TOKEN:
         print("❌ .env 설정 오류: API 키를 확인하세요.")
         return
 
-    print("="*50)
-    print("🚀 바이낸스 멀티 전략 봇 시작 (급등/크로스/돌파/구름대)")
-    print(f"⏰ 시작 시간: {datetime.now(KST).strftime('%Y-%m-%d %H:%M:%S')}")
-    print("="*50)
-    send_telegram_msg("✅ **멀티 전략 봇 시작됨**\n다양한 신호를 감시합니다.")
+    print("=" * 55)
+    print("🚀 실시간 멀티 전략 봇 시작")
+    print(f"   스캔 주기: {SCAN_INTERVAL_SECONDS}초")
+    print(f"   시간대: {TARGET_TIMEFRAMES}")
+    print(f"   상위 코인: {COIN_LIMIT}개")
+    print(f"⏰ 시작 시간: {datetime.now(KST).strftime('%Y-%m-%d %H:%M:%S')} KST")
+    print("=" * 55)
+
+    send_telegram_msg(
+        "✅ **실시간 멀티 전략 봇 시작**\n"
+        f"⏱ 스캔 주기: {SCAN_INTERVAL_SECONDS}초\n"
+        f"📊 시간대: {', '.join(TARGET_TIMEFRAMES)}\n"
+        f"🔍 전략: 급등/크로스/200EMA/구름대/RSI/MACD/볼린저"
+    )
 
     while True:
         try:
-            current_utc = wait_for_next_slot()
-            active_tfs = get_timeframes_to_check(current_utc)
-            current_kst_str = current_utc.astimezone(KST).strftime('%H:%M:%S')
-            
-            print(f"⏰ [{current_kst_str} KST] 스캔 시작: {active_tfs}")
-            
-            if not active_tfs:
-                continue
+            scan_start = time.time()
+            now_kst = datetime.now(KST).strftime('%H:%M:%S')
+            print(f"\n⏰ [{now_kst} KST] 스캔 시작...")
 
+            # 거래대금 상위 코인 조회
             tickers = binance.fetch_tickers()
-            volume_list = []
-            for symbol, ticker in tickers.items():
-                if '/USDT' in symbol and ticker['quoteVolume'] > 0:
-                    volume_list.append((symbol, ticker['quoteVolume']))
-            
-            # 거래대금 상위 코인 선정
+            volume_list = [
+                (symbol, ticker['quoteVolume'])
+                for symbol, ticker in tickers.items()
+                if '/USDT' in symbol and ticker.get('quoteVolume', 0) > 0
+            ]
             top_coins = sorted(volume_list, key=lambda x: x[1], reverse=True)[:COIN_LIMIT]
-            
+
             scan_count = 0
-            
+            alert_count = 0
+
             for symbol, _ in top_coins:
-                for tf in active_tfs:
+                for tf in TARGET_TIMEFRAMES:
                     try:
-                        ohlcv = binance.fetch_ohlcv(symbol, timeframe=tf, limit=100)
+                        ohlcv = binance.fetch_ohlcv(symbol, timeframe=tf, limit=120)
                         df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
                         df = calculate_indicators(df)
-                        
-                        # [변경] 멀티 전략 함수 호출
-                        signal_msg = check_multistrategy_signal(df)
                         scan_count += 1
-                        
-                        if signal_msg:
-                            last_candle_time = str(df.iloc[-2]['timestamp'])
-                            alert_key = f"{symbol}_{tf}"
-                            
-                            # 중복 알림 방지
-                            if alert_history.get(alert_key) == last_candle_time:
-                                continue 
-                            
-                            curr_price = df.iloc[-2]['close']
-                            
-                            # URL 생성 (심볼 정리)
-                            clean_symbol = symbol.split(':')[0]       # 'BTC/USDT:USDT' -> 'BTC/USDT'
-                            url_symbol = clean_symbol.replace("/", "") # 'BTC/USDT' -> 'BTCUSDT'
+
+                        signals = check_realtime_signals(df)
+
+                        for signal_name, signal_msg in signals:
+                            if not is_cooled_down(symbol, tf, signal_name):
+                                continue
+
+                            curr_price = df.iloc[-1]['close']
+                            clean_symbol = symbol.split(':')[0]
+                            url_symbol = clean_symbol.replace("/", "")
                             link = f"https://www.binance.com/en/futures/{url_symbol}"
-                            
+
                             msg = (
-                                f"🚨 **신호 포착 ({tf})** 🚨\n\n"
+                                f"🚨 **실시간 신호 ({tf})** 🚨\n\n"
                                 f"🪙 **{clean_symbol}**\n"
-                                f"{signal_msg}\n\n"  # 여러 신호가 있을 수 있음
-                                f"💰 현재가: {curr_price}\n"
-                                f"📊 거래량: {df.iloc[-2]['volume']:.1f}\n"
+                                f"{signal_msg}\n\n"
+                                f"💰 현재가: {curr_price:,.4f}\n"
+                                f"📊 거래량: {df.iloc[-1]['volume']:.1f}\n"
+                                f"🕐 감지 시각: {datetime.now(KST).strftime('%H:%M:%S')} KST\n"
                                 f"[👉 차트 보기]({link})"
                             )
-                            
                             send_telegram_msg(msg)
-                            print(f"   🔔 알림: {symbol} -> {signal_msg.replace(chr(10), ', ')}")
-                            alert_history[alert_key] = last_candle_time
-                            
+                            print(f"   🔔 {clean_symbol} [{tf}] → {signal_msg}")
+                            alert_count += 1
+
                         time.sleep(0.05)
                     except Exception:
                         continue
-            
-            print(f"✅ 스캔 완료 ({scan_count}회).")
-            
+
+            elapsed = time.time() - scan_start
+            print(f"✅ 스캔 완료 ({scan_count}건 분석, {alert_count}건 알림, {elapsed:.1f}초 소요)")
+
+            # 다음 스캔까지 대기
+            sleep_time = max(0, SCAN_INTERVAL_SECONDS - elapsed)
+            if sleep_time > 0:
+                print(f"💤 {sleep_time:.0f}초 대기...")
+                time.sleep(sleep_time)
+
+        except KeyboardInterrupt:
+            print("\n🛑 봇 종료됨.")
+            send_telegram_msg("🛑 **봇이 종료되었습니다.**")
+            break
         except Exception as e:
             print(f"⚠️ 에러 발생: {e}")
-            time.sleep(60)
+            time.sleep(30)
+
 
 if __name__ == "__main__":
     run_bot()
