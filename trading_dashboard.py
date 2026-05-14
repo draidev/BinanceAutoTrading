@@ -6,15 +6,13 @@ from plotly.subplots import make_subplots
 import time
 import os
 from dotenv import load_dotenv
+from common import calculate_indicators, check_signals, filter_signals, FETCH_LIMIT
 
 load_dotenv()
 
 BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
 BINANCE_SECRET = os.getenv("BINANCE_SECRET_KEY")
 
-# ---------------------------------------------------------
-# 1. 초기 설정
-# ---------------------------------------------------------
 st.set_page_config(page_title="Binance Pro Scanner", layout="wide", page_icon="📈")
 
 
@@ -32,140 +30,7 @@ binance = init_exchange()
 
 
 # ---------------------------------------------------------
-# 2. 지표 계산 (RSI, CCI, MACD, 볼린저 밴드)
-# ---------------------------------------------------------
-def calculate_indicators(df):
-    # EMA
-    for period in [20, 60, 120, 200]:
-        df[f'EMA_{period}'] = df['close'].ewm(span=period, adjust=False).mean()
-
-    # 일목균형표
-    high_9 = df['high'].rolling(window=9).max()
-    low_9 = df['low'].rolling(window=9).min()
-    df['tenkan_sen'] = (high_9 + low_9) / 2
-
-    high_26 = df['high'].rolling(window=26).max()
-    low_26 = df['low'].rolling(window=26).min()
-    df['kijun_sen'] = (high_26 + low_26) / 2
-
-    df['span_a'] = ((df['tenkan_sen'] + df['kijun_sen']) / 2).shift(26)
-    high_52 = df['high'].rolling(window=52).max()
-    low_52 = df['low'].rolling(window=52).min()
-    df['span_b'] = ((high_52 + low_52) / 2).shift(26)
-
-    # RSI (14)
-    delta = df['close'].diff()
-    gain = delta.where(delta > 0, 0).rolling(window=14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-    rs = gain / loss
-    df['RSI'] = 100 - (100 / (1 + rs))
-
-    # CCI (20)
-    tp = (df['high'] + df['low'] + df['close']) / 3
-    sma_tp = tp.rolling(window=20).mean()
-    mean_dev = (tp - sma_tp).abs().rolling(window=20).mean()
-    df['CCI'] = (tp - sma_tp) / (0.015 * mean_dev)
-
-    # MACD (12, 26, 9)
-    ema_12 = df['close'].ewm(span=12, adjust=False).mean()
-    ema_26 = df['close'].ewm(span=26, adjust=False).mean()
-    df['MACD'] = ema_12 - ema_26
-    df['MACD_signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
-    df['MACD_hist'] = df['MACD'] - df['MACD_signal']
-
-    # 볼린저 밴드 (20, 2σ)
-    df['BB_mid'] = df['close'].rolling(window=20).mean()
-    bb_std = df['close'].rolling(window=20).std()
-    df['BB_upper'] = df['BB_mid'] + 2 * bb_std
-    df['BB_lower'] = df['BB_mid'] - 2 * bb_std
-
-    return df
-
-
-# ---------------------------------------------------------
-# 3. 실시간 멀티 전략 신호 감지
-#    curr = df.iloc[-1] : 현재 진행 중인 봉 (실시간 가격)
-#    prev = df.iloc[-2] : 직전 마감 봉
-# ---------------------------------------------------------
-def check_multistrategy_signal(df, strategies):
-    if len(df) < 52:
-        return None
-
-    curr = df.iloc[-1]   # 현재 봉 (실시간)
-    prev = df.iloc[-2]   # 직전 마감 봉
-
-    signals = []
-
-    volume_surge = curr['volume'] > prev['volume'] * 2.0
-
-    # 1. 급등/급락 (현재가 vs 직전 마감가)
-    if strategies.get('surge'):
-        change_pct = (curr['close'] - prev['close']) / prev['close'] * 100
-        if change_pct >= 10.0:
-            signals.append(f"🚀 급등 (+{change_pct:.1f}%)")
-        elif change_pct <= -10.0:
-            signals.append(f"😱 급락 ({change_pct:.1f}%)")
-
-    # 2. EMA 크로스
-    if strategies.get('cross'):
-        if prev['EMA_20'] < prev['EMA_60'] and curr['EMA_20'] > curr['EMA_60']:
-            signals.append("✨ 골든 크로스 (20/60)")
-        if prev['EMA_20'] > prev['EMA_60'] and curr['EMA_20'] < curr['EMA_60']:
-            signals.append("☠️ 데드 크로스 (20/60)")
-
-    # 3. 200EMA 돌파
-    if strategies.get('ma200'):
-        if prev['close'] < prev['EMA_200'] and curr['close'] > curr['EMA_200'] and volume_surge:
-            signals.append("💥 200EMA 상향 돌파")
-        if prev['close'] > prev['EMA_200'] and curr['close'] < curr['EMA_200'] and volume_surge:
-            signals.append("📉 200EMA 하향 이탈")
-
-    # 4. 구름대 돌파
-    if strategies.get('cloud'):
-        if pd.notna(curr['span_a']) and pd.notna(curr['span_b']):
-            cloud_top = max(curr['span_a'], curr['span_b'])
-            cloud_bottom = min(curr['span_a'], curr['span_b'])
-
-            if curr['span_a'] < curr['span_b'] and volume_surge:
-                if prev['close'] <= cloud_top and curr['close'] > cloud_top:
-                    signals.append("☁️ 구름대 상향 돌파")
-            if curr['span_a'] > curr['span_b'] and volume_surge:
-                if prev['close'] >= cloud_bottom and curr['close'] < cloud_bottom:
-                    signals.append("🌧 구름대 하향 이탈")
-
-    # 5. RSI / CCI 과매수·과매도
-    if strategies.get('oscillators'):
-        if pd.notna(curr['RSI']):
-            if curr['RSI'] > 70:
-                signals.append(f"🔴 RSI 과매수 ({curr['RSI']:.0f})")
-            if curr['CCI'] > 100:
-                signals.append(f"🔴 CCI 과매수 ({curr['CCI']:.0f})")
-            if curr['RSI'] < 30:
-                signals.append(f"🔵 RSI 과매도 ({curr['RSI']:.0f})")
-            if curr['CCI'] < -100:
-                signals.append(f"🔵 CCI 과매도 ({curr['CCI']:.0f})")
-
-    # 6. MACD 크로스
-    if strategies.get('macd'):
-        if pd.notna(prev['MACD']) and pd.notna(curr['MACD']):
-            if prev['MACD'] < prev['MACD_signal'] and curr['MACD'] > curr['MACD_signal']:
-                signals.append("📗 MACD 골든 크로스")
-            if prev['MACD'] > prev['MACD_signal'] and curr['MACD'] < curr['MACD_signal']:
-                signals.append("📕 MACD 데드 크로스")
-
-    # 7. 볼린저 밴드 이탈
-    if strategies.get('bollinger'):
-        if pd.notna(curr['BB_upper']) and pd.notna(curr['BB_lower']):
-            if prev['close'] <= prev['BB_upper'] and curr['close'] > curr['BB_upper']:
-                signals.append("🔺 볼린저 상단 돌파")
-            if prev['close'] >= prev['BB_lower'] and curr['close'] < curr['BB_lower']:
-                signals.append("🔻 볼린저 하단 이탈")
-
-    return ", ".join(signals) if signals else None
-
-
-# ---------------------------------------------------------
-# 4. 데이터 스캔
+# 데이터 스캔
 # ---------------------------------------------------------
 def scan_market(target_timeframes, start_rank, end_rank, active_strategies):
     progress_bar = st.progress(0, text="시장 데이터를 불러오는 중...")
@@ -196,25 +61,27 @@ def scan_market(target_timeframes, start_rank, end_rank, active_strategies):
                 text=f"실시간 분석 중: {symbol} ({tf})"
             )
             try:
-                ohlcv = binance.fetch_ohlcv(symbol, timeframe=tf, limit=120)
+                ohlcv = binance.fetch_ohlcv(symbol, timeframe=tf, limit=FETCH_LIMIT)
                 df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
                 df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
                 df = calculate_indicators(df)
 
-                signal = check_multistrategy_signal(df, active_strategies)
+                signals = check_signals(df)
+                signal_str = filter_signals(signals, active_strategies)
 
-                if signal:
+                if signal_str:
                     results.append({
                         'symbol': symbol,
                         'timeframe': tf,
-                        'signal': signal,
-                        'price': df.iloc[-1]['close'],  # 현재가
+                        'signal': signal_str,
+                        'price': df.iloc[-1]['close'],
                         'rsi': df.iloc[-1]['RSI'] if pd.notna(df.iloc[-1]['RSI']) else None,
                         'macd_hist': df.iloc[-1]['MACD_hist'] if pd.notna(df.iloc[-1]['MACD_hist']) else None,
                         'data': df
                     })
                 time.sleep(0.05)
-            except Exception:
+            except Exception as e:
+                st.warning(f"⚠️ {symbol} [{tf}] 데이터 오류: {e}")
                 continue
 
     progress_bar.empty()
@@ -222,7 +89,7 @@ def scan_market(target_timeframes, start_rank, end_rank, active_strategies):
 
 
 # ---------------------------------------------------------
-# 5. 차트 그리기 (RSI + MACD 4행 구조)
+# 차트 그리기
 # ---------------------------------------------------------
 def plot_chart(item):
     df = item['data']
@@ -237,7 +104,7 @@ def plot_chart(item):
         subplot_titles=["", "Volume", "RSI", "MACD"]
     )
 
-    # --- Row 1: 캔들 + EMA + 구름대 + 볼린저 ---
+    # Row 1: 캔들 + EMA + 구름대 + 볼린저
     fig.add_trace(go.Candlestick(
         x=df['timestamp'],
         open=df['open'], high=df['high'],
@@ -245,7 +112,6 @@ def plot_chart(item):
         name='Price'
     ), row=1, col=1)
 
-    # 구름대
     fill_color = 'rgba(0, 255, 0, 0.08)'
     if any(kw in signal_type for kw in ['하향', '데드', '과매수', '급락']):
         fill_color = 'rgba(255, 0, 0, 0.08)'
@@ -260,7 +126,6 @@ def plot_chart(item):
         line=dict(color='rgba(0,0,0,0)'), name='Cloud'
     ), row=1, col=1)
 
-    # EMA
     ema_styles = {
         'EMA_20': ('yellow', 1),
         'EMA_60': ('orange', 1),
@@ -272,7 +137,6 @@ def plot_chart(item):
             line=dict(color=color, width=width), name=name
         ), row=1, col=1)
 
-    # 볼린저 밴드
     fig.add_trace(go.Scatter(
         x=df['timestamp'], y=df['BB_upper'],
         line=dict(color='rgba(173,216,230,0.5)', width=1, dash='dot'),
@@ -285,7 +149,7 @@ def plot_chart(item):
         name='BB Lower'
     ), row=1, col=1)
 
-    # --- Row 2: Volume ---
+    # Row 2: Volume
     vol_colors = [
         'rgba(0,200,100,0.6)' if df['close'].iloc[i] >= df['open'].iloc[i]
         else 'rgba(255,80,80,0.6)'
@@ -296,7 +160,7 @@ def plot_chart(item):
         marker_color=vol_colors, name='Volume', showlegend=False
     ), row=2, col=1)
 
-    # --- Row 3: RSI ---
+    # Row 3: RSI
     fig.add_trace(go.Scatter(
         x=df['timestamp'], y=df['RSI'],
         line=dict(color='mediumpurple', width=1.5), name='RSI'
@@ -306,7 +170,7 @@ def plot_chart(item):
     fig.add_hrect(y0=30, y1=70, fillcolor="rgba(128,128,128,0.05)",
                   line_width=0, row=3, col=1)
 
-    # --- Row 4: MACD ---
+    # Row 4: MACD
     fig.add_trace(go.Scatter(
         x=df['timestamp'], y=df['MACD'],
         line=dict(color='deepskyblue', width=1.5), name='MACD'
@@ -335,7 +199,6 @@ def plot_chart(item):
         legend=dict(orientation="h", y=1.02, x=0.5, xanchor="center")
     )
 
-    # Y축 레이블
     fig.update_yaxes(title_text="Price", row=1, col=1)
     fig.update_yaxes(title_text="Vol", row=2, col=1)
     fig.update_yaxes(title_text="RSI", range=[0, 100], row=3, col=1)
@@ -345,7 +208,7 @@ def plot_chart(item):
 
 
 # ---------------------------------------------------------
-# 6. UI 구성
+# UI 구성
 # ---------------------------------------------------------
 st.title("🚀 Binance Futures 실시간 Scanner")
 st.caption("현재 진행 중인 봉의 실시간 가격 기준으로 지표 돌파를 감지합니다.")
@@ -402,7 +265,7 @@ with st.sidebar:
             )
 
 # ---------------------------------------------------------
-# 7. 결과 표시
+# 결과 표시
 # ---------------------------------------------------------
 if 'scan_results' in st.session_state and st.session_state['scan_results']:
     results = st.session_state['scan_results']
@@ -427,7 +290,6 @@ if 'scan_results' in st.session_state and st.session_state['scan_results']:
             with st.container(border=True):
                 st.markdown(f"**{clean_symbol}** &nbsp; `{timeframe}`")
 
-                # 부가 정보 표시
                 info_parts = [f"{emoji} {signal_text}"]
                 if item.get('rsi') is not None:
                     st.caption(f"RSI: {item['rsi']:.1f} | MACD Hist: {item['macd_hist']:.4f}" if item.get('macd_hist') else f"RSI: {item['rsi']:.1f}")
